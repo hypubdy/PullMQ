@@ -1,0 +1,29 @@
+{
+  "name": "pullmq",
+  "version": "1.0.0",
+  "description": "Redis-based message queue with BullMQ-compatible API and group scheduling",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "ex:basic": "tsx examples/01-basic.ts",
+    "ex:groups": "tsx examples/02-groups.ts",
+    "ex:retry": "tsx examples/03-retry.ts",
+    "ex:concurrency": "tsx examples/04-concurrency.ts",
+    "stress": "tsx examples/05-stress.ts",
+    "ex:group-concurrency": "tsx examples/06-group-concurrency.ts",
+    "ex:pro-groups": "tsx examples/07-pro-groups.ts",
+    "bench": "tsx examples/bench.ts"
+  },
+  "keywords": ["queue", "redis", "bull", "jobs", "worker"],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "ioredis": "^5.11.1"
+  }
+}
