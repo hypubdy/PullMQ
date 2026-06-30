@@ -16,6 +16,38 @@ Redis-based message queue with a **BullMQ-compatible API** and full **BullMQ Pro
 
 ## Installation
 
+Package được publish lên **GitHub Packages** (không phải npmjs.com), nên cần cấu hình registry trước.
+
+### 1. Tạo file `.npmrc` trong thư mục dự án
+
+```
+@hypubdy:registry=https://npm.pkg.github.com
+```
+
+Hoặc chạy lệnh:
+
+```bash
+echo "@hypubdy:registry=https://npm.pkg.github.com" >> .npmrc
+```
+
+### 2. Đăng nhập GitHub Packages (chỉ cần làm một lần)
+
+Tạo [GitHub Personal Access Token](https://github.com/settings/tokens/new) với quyền `read:packages`, sau đó:
+
+```bash
+npm login --registry=https://npm.pkg.github.com --scope=@hypubdy
+# Username: <GitHub username>
+# Password: <Personal Access Token>
+```
+
+Hoặc thêm token trực tiếp vào `~/.npmrc`:
+
+```
+//npm.pkg.github.com/:_authToken=YOUR_GITHUB_TOKEN
+```
+
+### 3. Cài đặt
+
 ```bash
 npm install @hypubdy/pullmq ioredis
 # or
