@@ -393,6 +393,116 @@ describe('Local group concurrency (setGroupConcurrency)', () => {
   })
 })
 
+describe('Delayed job promotion race across multiple workers', () => {
+  afterEach(flush)
+
+  it('promotes a delayed job to :ready exactly once even when 3 workers race on it', async () => {
+    const queue = new Queue<{ i: number }, void>('grp-delay-race', { connection })
+    const keyPrefix = 'bull:grp-delay-race'
+    const client = new Redis(connection)
+
+    const job = await queue.add('t', { i: 0 }, { delay: 1 })
+    // Let the delay elapse so all 3 workers see it as due via ZRANGEBYSCORE.
+    await new Promise((r) => setTimeout(r, 10))
+
+    const workers = Array.from({ length: 3 }, () =>
+      new Worker<{ i: number }, void>(
+        'grp-delay-race',
+        async () => {},
+        { connection, autorun: false, drainDelay: 1 },
+      ),
+    )
+    workers.forEach((w) => w.on('error', () => {}))
+
+    // Reproduce the reported race: 3 worker processes each read :delayed via
+    // ZRANGEBYSCORE and all see job J before any of them finishes its ZREM
+    // pipeline — reach into the private per-tick method to run all 3
+    // concurrently and deterministically, instead of racing real 1s timers.
+    const claimants = workers as unknown as Array<{ promoteDelayedJobsOnce(): Promise<void> }>
+    await Promise.all(claimants.map((w) => w.promoteDelayedJobsOnce()))
+
+    const readyEntries = await client.lrange(`${keyPrefix}:ready`, 0, -1)
+    const occurrences = readyEntries.filter((id) => id === job.id).length
+
+    // Only the worker whose ZREM actually removed the member may re-enqueue it.
+    expect(occurrences).toBe(1)
+    expect(await client.zscore(`${keyPrefix}:delayed`, job.id)).toBeNull()
+
+    await client.quit()
+    await Promise.all(workers.map((w) => w.close()))
+    await queue.obliterate({ force: true })
+    await queue.close()
+  })
+})
+
+describe('Group slot leak when job hash disappears mid-dispatch', () => {
+  afterEach(flush)
+
+  it('releases running:{groupId} instead of leaking it when the job hash is gone by the time the worker loads it', async () => {
+    const GROUP_CONCURRENCY = 2
+    const queue = new Queue<{ i: number }, void>('grp-vanish', { connection })
+    const keyPrefix = 'bull:grp-vanish'
+    const client = new Redis(connection)
+
+    const jobs = await Promise.all(
+      Array.from({ length: GROUP_CONCURRENCY }, (_, i) =>
+        queue.add('t', { i }, { group: { id: 'tenant-A' } }),
+      ),
+    )
+
+    const worker = new Worker<{ i: number }, void>(
+      'grp-vanish',
+      async () => {},
+      { connection, autorun: false, drainDelay: 1, group: { concurrency: GROUP_CONCURRENCY } },
+    )
+    worker.on('error', () => {})
+    // Reach into private methods to drive the exact race deterministically,
+    // instead of racing real timers against a running worker loop.
+    const w = worker as unknown as {
+      scheduleOneGroup(groupId: string): Promise<boolean>
+      processJob(jobId: string): Promise<void>
+    }
+
+    // Reproduce the reported race: scheduleOneGroup() dispatches both jobs —
+    // INCR running:tenant-A twice and RPUSH both ids to :ready — exactly as
+    // it would in production. Before the worker gets around to loading them,
+    // something deletes both job hashes (obliterate(), remove(), or Redis
+    // LRU eviction under memory pressure).
+    const scheduled = await w.scheduleOneGroup('tenant-A')
+    expect(scheduled).toBe(true)
+    expect(await client.get(`${keyPrefix}:running:tenant-A`)).toBe(String(GROUP_CONCURRENCY))
+
+    for (const job of jobs) {
+      await client.del(`${keyPrefix}:job:${job.id}`)
+    }
+
+    // Worker pulls both now-orphaned ids off :ready, same as mainLoop does,
+    // and finds no job hash for either — Job.fromId() returns null.
+    let jobId: string | null
+    while ((jobId = await client.lpop(`${keyPrefix}:ready`))) {
+      await w.processJob(jobId)
+    }
+
+    // The counter must come back down, not stay pinned at maxGroupConcurrency.
+    expect(await client.get(`${keyPrefix}:running:tenant-A`)).toBe('0')
+    for (const job of jobs) {
+      expect(await client.hget(`${keyPrefix}:group:job-map`, job.id)).toBeNull()
+    }
+
+    // The real regression check: before the fix, tenant-A would be stalled
+    // forever here because running:tenant-A stayed pinned at
+    // maxGroupConcurrency with nothing left able to decrement it.
+    await queue.add('t', { i: 99 }, { group: { id: 'tenant-A' } })
+    const scheduledAgain = await w.scheduleOneGroup('tenant-A')
+    expect(scheduledAgain).toBe(true)
+
+    await client.quit()
+    await worker.close()
+    await queue.obliterate({ force: true })
+    await queue.close()
+  })
+})
+
 describe('Manual group rate limit (Worker.RateLimitError)', () => {
   afterEach(flush)
 

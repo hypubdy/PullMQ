@@ -186,6 +186,14 @@ export class Job<
     if ((await this.client.zscore(`${qn}:completed`, this.id)) !== null) return 'completed';
     const inReady = await this.client.lpos(`${qn}:ready`, this.id);
     if (inReady !== null) return 'waiting';
+    // Check group queues — jobs waiting here are 'waiting', not 'unknown'/'paused'.
+    const groupId = this.opts.group?.id;
+    if (groupId) {
+      const inGroupList = await this.client.lpos(`${qn}:group:${groupId}`, this.id);
+      if (inGroupList !== null) return 'waiting';
+      const inGroupPriority = await this.client.zscore(`${qn}:group:priority:${groupId}`, this.id);
+      if (inGroupPriority !== null) return 'waiting';
+    }
     const isPaused = await this.client.exists(`${qn}:paused`);
     if (isPaused) return 'paused';
     return 'unknown';

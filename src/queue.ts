@@ -11,6 +11,26 @@ import { Job } from './job';
 import { createClient } from './connection';
 import { GroupMaxSizeExceededError } from './errors';
 
+// Atomically checks group size and enqueues the job in one round-trip.
+// Returns 1 on success, 0 when maxSize would be exceeded.
+const LUA_GROUP_ENQUEUE = `
+local listKey  = KEYS[1]
+local zsetKey  = KEYS[2]
+local maxSize  = tonumber(ARGV[1])
+local jobId    = ARGV[2]
+local priority = tonumber(ARGV[3])
+if maxSize > 0 then
+  local sz = redis.call('llen', listKey) + redis.call('zcard', zsetKey)
+  if sz >= maxSize then return 0 end
+end
+if priority > 0 then
+  redis.call('zadd', zsetKey, priority, jobId)
+else
+  redis.call('rpush', listKey, jobId)
+end
+return 1
+`;
+
 export class Queue<
   DataType = unknown,
   ResultType = unknown,
@@ -81,23 +101,21 @@ export class Queue<
     }
 
     if (groupId) {
-      // ── maxSize guard ──────────────────────────────────────────────────────
       const maxSize = job.opts.group?.maxSize;
-      if (maxSize !== undefined) {
-        const listLen = await this.client.llen(`${this.keyPrefix}:group:${groupId}`);
-        const zsetLen = await this.client.zcard(`${this.keyPrefix}:group:priority:${groupId}`);
-        if (listLen + zsetLen >= maxSize) {
-          throw new GroupMaxSizeExceededError(groupId, maxSize);
-        }
-      }
-
-      // ── Enqueue to intra-group priority ZSET or FIFO LIST ─────────────────
       const groupPriority = job.opts.group?.priority ?? 0;
-      if (groupPriority > 0) {
-        await this.client.zadd(`${this.keyPrefix}:group:priority:${groupId}`, groupPriority, job.id);
-      } else {
-        await this.client.rpush(`${this.keyPrefix}:group:${groupId}`, job.id);
-      }
+
+      // Atomic size-check + enqueue via Lua: eliminates the TOCTOU race where
+      // two concurrent add() calls both pass a non-atomic llen+zcard check.
+      const ok = await (this.client as Redis).eval(
+        LUA_GROUP_ENQUEUE,
+        2,
+        `${this.keyPrefix}:group:${groupId}`,
+        `${this.keyPrefix}:group:priority:${groupId}`,
+        String(maxSize ?? 0),
+        job.id,
+        String(groupPriority),
+      );
+      if (ok === 0) throw new GroupMaxSizeExceededError(groupId, maxSize!);
 
       // ── Register group in round-robin tracking ────────────────────────────
       const added = await this.client.sadd(`${this.keyPrefix}:groups:set`, groupId);

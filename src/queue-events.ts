@@ -53,7 +53,6 @@ export class QueueEvents extends EventEmitter {
 
         for (const [, messages] of result) {
           for (const [msgId, fields] of messages) {
-            this.lastId = msgId;
             const kv: Record<string, string> = {};
             for (let i = 0; i < fields.length; i += 2) {
               kv[fields[i]] = fields[i + 1];
@@ -63,8 +62,17 @@ export class QueueEvents extends EventEmitter {
             const data: Record<string, unknown> = kv['data'] ? JSON.parse(kv['data']) : {};
 
             if (event) {
-              this.emit(event, data, msgId);
+              // Wrap emit so a throwing listener does not prevent lastId from
+              // advancing — the event was delivered even if a listener errored.
+              try {
+                this.emit(event, data, msgId);
+              } catch (listenerErr) {
+                this.emit('error', listenerErr);
+              }
             }
+            // Advance lastId only after delivery so a crash before this line
+            // causes a replay on reconnect rather than a silent skip.
+            this.lastId = msgId;
           }
         }
       } catch (err) {

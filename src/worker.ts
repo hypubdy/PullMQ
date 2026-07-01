@@ -37,6 +37,9 @@ export class Worker<
   private delayedTimer: ReturnType<typeof setInterval> | null = null;
   private stalledTimer: ReturnType<typeof setInterval> | null = null;
   private schedulerLoopActive = false;
+  // Guards against promoteDelayedJobs() overlapping itself: setInterval fires
+  // on a fixed schedule regardless of whether the previous async call finished.
+  private promotingDelayed = false;
   // Semaphore: mainLoop waiters blocked on concurrency limit
   private slotWaiters: Array<() => void> = [];
 
@@ -195,11 +198,8 @@ export class Worker<
   }
 
   private async nextFromPriority(): Promise<string | null> {
-    const items = await this.client.zrange(`${this.keyPrefix}:priority`, 0, 0);
-    if (!items.length) return null;
-    const id = items[0];
-    const removed = await this.client.zrem(`${this.keyPrefix}:priority`, id);
-    return removed ? id : null;
+    const result = await this.client.zpopmin(`${this.keyPrefix}:priority`, 1);
+    return result.length > 0 ? result[0] : null;
   }
 
   // ─── Single job lifecycle ──────────────────────────────────────────────────
@@ -217,6 +217,7 @@ export class Worker<
       );
 
       if (!job) {
+        await this.releaseGroupSlotForMissingJob(jobId);
         this.releaseSlot();
         return;
       }
@@ -310,14 +311,31 @@ export class Worker<
     await this.client.lrem(`${this.keyPrefix}:active`, 1, job.id);
     await this.client.del(`${this.keyPrefix}:processing:${job.id}`);
 
-    // Group cleanup: decrement concurrency and re-enqueue group if it still has jobs
+    // Group cleanup: use HDEL as an ownership gate so that if the stalled
+    // checker already released this slot, cleanup() does not double-decrement.
     const groupId = job.opts.group?.id;
     if (groupId) {
-      const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
-      // If counter went negative (stale), reset to 0
-      if (remaining < 0) {
-        await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
+      const owned = await this.client.hdel(`${this.keyPrefix}:group:job-map`, job.id);
+      if (owned > 0) {
+        const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
+        if (remaining < 0) {
+          await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
+        }
       }
+    }
+  }
+
+  // A job was dispatched from scheduleOneGroup() (which already INCR'd
+  // running:{groupId}) but its hash is gone by the time we tried to load it,
+  // so cleanup() never runs and the group slot would otherwise leak forever.
+  // Recover the groupId from the dispatch-time map and release the slot here.
+  private async releaseGroupSlotForMissingJob(jobId: string): Promise<void> {
+    const groupId = await this.client.hget(`${this.keyPrefix}:group:job-map`, jobId);
+    if (!groupId) return;
+    await this.client.hdel(`${this.keyPrefix}:group:job-map`, jobId);
+    const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
+    if (remaining < 0) {
+      await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
     }
   }
 
@@ -400,7 +418,9 @@ export class Worker<
     job: Job<DataType, ResultType, NameType>,
     outcome: 'complete' | 'fail',
   ): Promise<void> {
-    const policy = outcome === 'complete' ? job.opts.removeOnComplete : job.opts.removeOnFail;
+    const policy = outcome === 'complete'
+      ? (job.opts.removeOnComplete ?? this.opts.removeOnComplete)
+      : (job.opts.removeOnFail ?? this.opts.removeOnFail);
     const setKey = `${this.keyPrefix}:${outcome === 'complete' ? 'completed' : 'failed'}`;
 
     if (policy === true) {
@@ -534,7 +554,18 @@ export class Worker<
     }
 
     // ── 5. Fill available slots ───────────────────────────────────────────────
-    const availableSlots = maxGroupConcurrency - currentRunning;
+    // Re-read currentRunning inside the lock: another worker may have incremented
+    // it between our pre-lock GET (step 3) and now, making the pre-lock value stale.
+    const freshRunning = parseInt(
+      (await this.client.get(`${this.keyPrefix}:running:${groupId}`)) ?? '0',
+      10,
+    );
+    if (freshRunning >= maxGroupConcurrency) {
+      await this.client.del(lockKey);
+      await this.client.rpush(activeKey, groupId);
+      return false;
+    }
+    const availableSlots = maxGroupConcurrency - freshRunning;
     let scheduled = 0;
 
     for (let i = 0; i < availableSlots; i++) {
@@ -572,6 +603,10 @@ export class Worker<
       }
 
       await this.client.incr(`${this.keyPrefix}:running:${groupId}`);
+      // Recorded independently of the job hash so the group slot can still be
+      // released if the job hash disappears before cleanup() runs (obliterate,
+      // remove(), LRU eviction). See releaseGroupSlotForMissingJob().
+      await this.client.hset(`${this.keyPrefix}:group:job-map`, jobId, groupId);
       await this.client.rpush(`${this.keyPrefix}:ready`, jobId);
       scheduled++;
     }
@@ -609,6 +644,20 @@ export class Worker<
 
   private async promoteDelayedJobs(): Promise<void> {
     if (this._closing) return;
+    // Prevent this call from overlapping a still-running previous call (this
+    // worker's own setInterval tick) in addition to the cross-worker guard
+    // below — otherwise the same id could be re-enqueued by both overlapping
+    // calls before either sees the other's ZREM.
+    if (this.promotingDelayed) return;
+    this.promotingDelayed = true;
+    try {
+      await this.promoteDelayedJobsOnce();
+    } finally {
+      this.promotingDelayed = false;
+    }
+  }
+
+  private async promoteDelayedJobsOnce(): Promise<void> {
     const now = Date.now();
     const ids = await this.client.zrangebyscore(`${this.keyPrefix}:delayed`, '-inf', now);
     if (!ids.length) return;
@@ -617,9 +666,16 @@ export class Worker<
     for (const id of ids) {
       pipe.zrem(`${this.keyPrefix}:delayed`, id);
     }
-    await pipe.exec();
+    const results = await pipe.exec();
 
-    for (const id of ids) {
+    // ZREM is the atomic hand-off: only the caller whose ZREM actually removed
+    // the member (result === 1) owns promoting it. Every other worker (or an
+    // overlapping call in this same process) sees 0 and must not re-enqueue —
+    // otherwise the same job lands in :ready multiple times.
+    const claimedIds = ids.filter((_, i) => results?.[i]?.[1] === 1);
+    if (!claimedIds.length) return;
+
+    for (const id of claimedIds) {
       // Re-enqueue respecting group/priority
       const job = await Job.fromId<DataType, ResultType, NameType>(
         this.client, this.name, this.opts.prefix ?? 'bull', id,
@@ -673,7 +729,10 @@ export class Worker<
       const job = await Job.fromId<DataType, ResultType, NameType>(
         this.client, this.name, this.opts.prefix ?? 'bull', jobId,
       );
-      if (!job) continue;
+      if (!job) {
+        await this.releaseGroupSlotForMissingJob(jobId);
+        continue;
+      }
 
       const maxStalledCount = this.opts.maxStalledCount ?? 1;
 
@@ -682,7 +741,11 @@ export class Worker<
       if (job.stalledCounter >= maxStalledCount) {
         // Permanently failed — free the group slot before moving to failed set.
         if (groupId) {
-          await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
+          const owned = await this.client.hdel(`${this.keyPrefix}:group:job-map`, jobId);
+          if (owned > 0) {
+            const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
+            if (remaining < 0) await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
+          }
         }
         job.failedReason = 'job stalled more than allowable limit';
         job.finishedOn = Date.now();
@@ -695,7 +758,11 @@ export class Worker<
         await job.save();
 
         if (groupId) {
-          await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
+          const owned = await this.client.hdel(`${this.keyPrefix}:group:job-map`, jobId);
+          if (owned > 0) {
+            const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
+            if (remaining < 0) await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
+          }
           // Re-enqueue respecting intra-group priority.
           const groupPriority = job.opts.group?.priority ?? 0;
           if (groupPriority > 0) {
