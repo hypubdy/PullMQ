@@ -10,7 +10,8 @@ import type {
 import { Job } from './job';
 import { createClient } from './connection';
 import { GroupMaxSizeExceededError } from './errors';
-import { LUA_GROUP_ENQUEUE } from './scripts';
+import { scripted } from './scripts';
+import { promoteDueDelayedJobs } from './promotion';
 
 export class Queue<
   DataType = unknown,
@@ -59,7 +60,16 @@ export class Queue<
       jobOpts,
     );
     await job.save();
-    await this.enqueue(job);
+    try {
+      await this.enqueue(job);
+    } catch (err) {
+      // Admission was refused (group maxSize) — the hash written above is
+      // referenced by nothing, so delete it instead of leaking it forever.
+      if (err instanceof GroupMaxSizeExceededError) {
+        await this.client.del(`${this.keyPrefix}:job:${job.id}`).catch(() => {/* best effort */});
+      }
+      throw err;
+    }
     await this.xadd('added', { jobId: job.id, name: job.name });
     this.emit('waiting', job);
     return job;
@@ -85,26 +95,24 @@ export class Queue<
       const maxSize = job.opts.group?.maxSize;
       const groupPriority = job.opts.group?.priority ?? 0;
 
-      // Atomic size-check + enqueue via Lua: eliminates the TOCTOU race where
-      // two concurrent add() calls both pass a non-atomic llen+zcard check.
+      // Atomic size-check + enqueue + rotation registration via Lua: eliminates
+      // both the TOCTOU race where two concurrent add() calls pass a non-atomic
+      // llen+zcard check, and the crash window where the job landed in the
+      // group list but the group never made it into groups:set/groups:active.
       // maxSize=undefined is passed as -1 ("unlimited") so it stays distinct
       // from an explicit maxSize:0 ("reject every add").
-      const ok = await this.client.eval(
-        LUA_GROUP_ENQUEUE,
-        2,
+      const ok = await scripted(this.client).pmqGroupEnqueue(
         `${this.keyPrefix}:group:${groupId}`,
         `${this.keyPrefix}:group:priority:${groupId}`,
+        `${this.keyPrefix}:groups:set`,
+        `${this.keyPrefix}:groups:active`,
         String(maxSize ?? -1),
         job.id,
         String(groupPriority),
+        groupId,
+        'rpush',
       );
       if (ok === 0) throw new GroupMaxSizeExceededError(groupId, maxSize ?? 0);
-
-      // ── Register group in round-robin tracking ────────────────────────────
-      const added = await this.client.sadd(`${this.keyPrefix}:groups:set`, groupId);
-      if (added === 1) {
-        await this.client.rpush(`${this.keyPrefix}:groups:active`, groupId);
-      }
       return;
     }
 
@@ -329,17 +337,12 @@ export class Queue<
   }
 
   async promoteJobs(opts: { count?: number } = {}): Promise<void> {
-    const count = opts.count ?? 1000;
-    const now = Date.now();
-    const ids = await this.client.zrangebyscore(
-      `${this.keyPrefix}:delayed`, '-inf', now, 'LIMIT', 0, count,
-    );
-    const pipe = this.client.pipeline();
-    for (const id of ids) {
-      pipe.zrem(`${this.keyPrefix}:delayed`, id);
-      pipe.rpush(`${this.keyPrefix}:ready`, id);
-    }
-    await pipe.exec();
+    // Delegates to the same promotion logic the Worker uses, so manual
+    // promotion honors group routing, intra-group priority, maxSize and the
+    // ZREM claim — instead of blind-pushing every id into :ready.
+    await promoteDueDelayedJobs(this.client, this.name, this.opts.prefix, {
+      limit: opts.count ?? 1000,
+    });
   }
 
   // ─── Group controls ──────────────────────────────────────────────────────────
@@ -363,10 +366,15 @@ export class Queue<
   async resumeGroup(groupId: string): Promise<boolean> {
     const removed = await this.client.srem(`${this.keyPrefix}:groups:paused`, groupId);
     if (removed === 0) return false;
-    // Re-add to active list so the scheduler picks it up again.
+    // With non-destructive rotation a paused group normally never left
+    // groups:active — only push it back if it is genuinely absent (e.g. it was
+    // retired while paused), to avoid piling up duplicate rotation entries.
     const inSet = await this.client.sismember(`${this.keyPrefix}:groups:set`, groupId);
     if (inSet) {
-      await this.client.rpush(`${this.keyPrefix}:groups:active`, groupId);
+      const pos = await this.client.lpos(`${this.keyPrefix}:groups:active`, groupId);
+      if (pos === null) {
+        await this.client.rpush(`${this.keyPrefix}:groups:active`, groupId);
+      }
     }
     await this.xadd('group-resumed', { groupId });
     return true;

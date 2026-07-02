@@ -70,9 +70,7 @@ export class QueueEvents extends EventEmitter {
               try {
                 this.emit(event, data, msgId);
               } catch (listenerErr) {
-                if (this.listenerCount('error') > 0) {
-                  this.emit('error', listenerErr);
-                }
+                this.emitErrorSafely(listenerErr);
               }
             }
             // Advance lastId only after delivery so a crash before this line
@@ -82,12 +80,22 @@ export class QueueEvents extends EventEmitter {
         }
       } catch (err) {
         if (!this._closing) {
-          if (this.listenerCount('error') > 0) {
-            this.emit('error', err);
-          }
+          this.emitErrorSafely(err);
           await new Promise((r) => setTimeout(r, 1000));
         }
       }
+    }
+  }
+
+  // Emitting 'error' with no listener throws synchronously, and a listener
+  // that itself throws would escape the surrounding catch — either way the
+  // read loop would die. Never let an error listener kill event delivery.
+  private emitErrorSafely(err: unknown): void {
+    if (this.listenerCount('error') === 0) return;
+    try {
+      this.emit('error', err);
+    } catch {
+      /* a throwing 'error' listener must not kill the read loop */
     }
   }
 

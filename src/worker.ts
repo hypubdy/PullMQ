@@ -4,7 +4,8 @@ import type { WorkerOptions, Processor, JobsOptions } from './types';
 import { Job } from './job';
 import { createClient } from './connection';
 import { UnrecoverableError, GroupRateLimitError } from './errors';
-import { LUA_GROUP_ENQUEUE, LUA_DISPATCH_JOB } from './scripts';
+import { scripted } from './scripts';
+import { promoteDueDelayedJobs } from './promotion';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -43,6 +44,9 @@ export class Worker<
   private promotingDelayed = false;
   // Semaphore: mainLoop waiters blocked on concurrency limit
   private slotWaiters: Array<() => void> = [];
+  // Jobs seen in :active without a processing lock on the last stalled scan —
+  // reclaimed only if still lockless on the next scan (see checkStalledJobs).
+  private stalledSuspects = new Set<string>();
 
   constructor(
     name: string,
@@ -165,9 +169,17 @@ export class Worker<
         continue;
       }
 
-      // ── Job pickup (non-blocking first, then BLPOP) ────────────────────────
+      // ── Job pickup (non-blocking first, then BLMOVE) ───────────────────────
+      // Pickup moves :ready → :active atomically (LMOVE / Lua zpopmin+rpush),
+      // so a crash right after pickup leaves the job visible in :active where
+      // the stalled checker recovers it — it can never vanish from every
+      // structure at once the way the old LPOP-then-RPUSH two-step allowed.
       let jobId = await this.nextFromPriority();
-      if (!jobId) jobId = await this.client.lpop(`${this.keyPrefix}:ready`);
+      if (!jobId) {
+        jobId = await this.client.lmove(
+          `${this.keyPrefix}:ready`, `${this.keyPrefix}:active`, 'LEFT', 'RIGHT',
+        );
+      }
 
       if (jobId) {
         // Claim the slot before firing so activeCount is accurate during the call.
@@ -178,15 +190,15 @@ export class Worker<
 
       // Queue is empty — block until a job arrives (or timeout).
       const timeout = this.opts.drainDelay ?? 5;
-      const result = await this.blockingClient
-        .blpop(`${this.keyPrefix}:ready`, timeout)
+      const moved = await this.blockingClient
+        .blmove(`${this.keyPrefix}:ready`, `${this.keyPrefix}:active`, 'LEFT', 'RIGHT', timeout)
         .catch(() => null);
 
-      if (!result) {
+      if (!moved) {
         this.emit('drained');
       } else {
         this.activeCount++;
-        this.processJob(result[1]).catch((err) => this.emit('error', err));
+        this.processJob(moved).catch((err) => this.emit('error', err));
       }
     }
   }
@@ -199,8 +211,10 @@ export class Worker<
   }
 
   private async nextFromPriority(): Promise<string | null> {
-    const result = await this.client.zpopmin(`${this.keyPrefix}:priority`, 1);
-    return result.length > 0 ? result[0] : null;
+    // Atomic zpopmin + rpush :active — see the pickup comment in mainLoop.
+    return scripted(this.client).pmqPickupPriority(
+      `${this.keyPrefix}:priority`, `${this.keyPrefix}:active`,
+    );
   }
 
   // ─── Single job lifecycle ──────────────────────────────────────────────────
@@ -210,6 +224,12 @@ export class Worker<
     const token = `${this.id}:${jobId}`;
 
     try {
+      // The job is already in :active (atomic pickup). Set the processing lock
+      // FIRST — before even loading the hash — so another worker's stalled
+      // checker sees a locked job, not a stall, in the pickup-to-activation gap.
+      const lockDuration = this.opts.lockDuration ?? 30000;
+      await this.client.set(`${this.keyPrefix}:processing:${jobId}`, token, 'PX', lockDuration);
+
       const job = await Job.fromId<DataType, ResultType, NameType>(
         this.client,
         this.name,
@@ -218,12 +238,16 @@ export class Worker<
       );
 
       if (!job) {
-        await this.releaseGroupSlotForMissingJob(jobId);
-        this.releaseSlot();
+        await this.abandonPickedUpJob(jobId, token);
         return;
       }
 
-      await this.lockAndActivate(job, token);
+      const activated = await this.lockAndActivate(job, token);
+      if (!activated) {
+        // Queue.remove() won the race between pickup and activation;
+        // lockAndActivate already undid the pickup bookkeeping.
+        return;
+      }
 
       try {
         if (!this.processor) throw new Error('No processor defined');
@@ -233,9 +257,15 @@ export class Worker<
 
         job.returnvalue = result;
         job.finishedOn = Date.now();
-        await job.save();
 
-        await this.onCompleted(job, token);
+        if (await job.saveIfExists()) {
+          await this.onCompleted(job, token);
+        } else {
+          // Job was removed mid-processing — drop the result instead of
+          // resurrecting the hash and recording a completion for a removed job.
+          this.inMemoryCleanup(job.id);
+          await this.finishJob({ jobId: job.id, token, groupId: job.opts.group?.id, mode: 'none' });
+        }
 
       } catch (err) {
         if (err instanceof GroupRateLimitError) {
@@ -248,44 +278,113 @@ export class Worker<
         }
       }
     } finally {
+      // Single release point — the try block must never call releaseSlot()
+      // itself, or the slot is double-released and activeCount goes negative,
+      // silently raising the effective concurrency.
       this.releaseSlot();
     }
+  }
+
+  // Atomically detach a job from :active + its lock and attach it to its
+  // destination in ONE Lua call (pmqFinishJob). Every transition out of
+  // :active must go through here: doing detach and attach as separate
+  // round-trips loses the job if the process dies in between.
+  private async finishJob(opts: {
+    jobId: string;
+    token: string;
+    groupId?: string;
+    mode: 'zadd' | 'list' | 'none';
+    destKey?: string;
+    score?: number;
+    pushCmd?: 'lpush' | 'rpush';
+    register?: boolean;
+    guard?: boolean;
+  }): Promise<number> {
+    const groupId = opts.groupId ?? '';
+    return scripted(this.client).pmqFinishJob(
+      `${this.keyPrefix}:active`,
+      `${this.keyPrefix}:processing:${opts.jobId}`,
+      `${this.keyPrefix}:group:job-map`,
+      // Dummy key when there is no group — the script never touches it then.
+      `${this.keyPrefix}:running:${groupId || '-'}`,
+      opts.destKey ?? `${this.keyPrefix}:ready`,
+      `${this.keyPrefix}:groups:set`,
+      `${this.keyPrefix}:groups:active`,
+      opts.jobId, opts.token, groupId, opts.mode,
+      String(opts.score ?? 0), opts.pushCmd ?? 'rpush',
+      opts.register ? '1' : '0', opts.guard ? '1' : '0',
+    );
+  }
+
+  private inMemoryCleanup(jobId: string): void {
+    const entry = this.activeJobs.get(jobId);
+    if (entry) {
+      clearInterval(entry.renewalTimer);
+      this.activeJobs.delete(jobId);
+    }
+  }
+
+  // A picked-up job turned out to have no hash (removed or evicted after
+  // dispatch). Undo the pickup bookkeeping and release its group slot.
+  private async abandonPickedUpJob(jobId: string, token: string): Promise<void> {
+    // The hash is gone, so the groupId must be recovered from the dispatch map.
+    const groupId = await this.client.hget(`${this.keyPrefix}:group:job-map`, jobId);
+    await this.finishJob({ jobId, token, groupId: groupId ?? '', mode: 'none' });
   }
 
   private async onRateLimited(
     job: Job<DataType, ResultType, NameType>,
     token: string,
   ): Promise<void> {
-    await this.cleanup(job);
+    this.inMemoryCleanup(job.id);
     const groupId = job.opts.group?.id;
+
+    // A job removed while processing must not have its id resurrected into a
+    // queue structure — the id would dangle with no hash behind it.
+    const stillExists = await this.client.exists(`${this.keyPrefix}:job:${job.id}`);
+    if (!stillExists) {
+      await this.finishJob({ jobId: job.id, token, groupId, mode: 'none' });
+      return;
+    }
+
     if (groupId) {
-      // Re-enqueue at front so the job is next when the limit lifts.
+      // Re-enqueue at the FRONT (lpush) so the job is next when the limit
+      // lifts; re-admission never re-checks maxSize (the job was already in).
       const groupPriority = job.opts.group?.priority ?? 0;
-      if (groupPriority > 0) {
-        await this.client.zadd(`${this.keyPrefix}:group:priority:${groupId}`, groupPriority, job.id);
-      } else {
-        await this.client.lpush(`${this.keyPrefix}:group:${groupId}`, job.id);
-      }
-      const added = await this.client.sadd(`${this.keyPrefix}:groups:set`, groupId);
-      if (added) await this.client.rpush(`${this.keyPrefix}:groups:active`, groupId);
+      await this.finishJob(groupPriority > 0
+        ? {
+            jobId: job.id, token, groupId, mode: 'zadd',
+            destKey: `${this.keyPrefix}:group:priority:${groupId}`,
+            score: groupPriority, register: true,
+          }
+        : {
+            jobId: job.id, token, groupId, mode: 'list',
+            destKey: `${this.keyPrefix}:group:${groupId}`,
+            pushCmd: 'lpush', register: true,
+          });
     } else {
-      await this.client.rpush(`${this.keyPrefix}:ready`, job.id);
+      await this.finishJob({ jobId: job.id, token, mode: 'list' });
     }
     await this.xadd('rate-limited', { jobId: job.id });
   }
 
+  // The processing lock and the :active entry already exist by the time this
+  // runs (set during atomic pickup / processJob). Returns false when the job
+  // hash disappeared in the meantime — i.e. the job was removed — in which
+  // case the pickup bookkeeping is undone and processing must not start.
   private async lockAndActivate(
     job: Job<DataType, ResultType, NameType>,
     token: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const lockDuration = this.opts.lockDuration ?? 30000;
-    await this.client.set(`${this.keyPrefix}:processing:${job.id}`, token, 'PX', lockDuration);
-    await this.client.rpush(`${this.keyPrefix}:active`, job.id);
 
     job.processedOn = Date.now();
     job.attemptsStarted++;
     job.attemptsMade++;
-    await job.save();
+    if (!(await job.saveIfExists())) {
+      await this.finishJob({ jobId: job.id, token, groupId: job.opts.group?.id, mode: 'none' });
+      return false;
+    }
 
     // Renew lock periodically
     const renewalInterval = this.opts.lockRenewTime ?? Math.floor(lockDuration / 2);
@@ -301,29 +400,7 @@ export class Worker<
 
     await this.xadd('active', { jobId: job.id, prev: 'waiting' });
     this.emit('active', job, 'waiting');
-  }
-
-  private async cleanup(job: Job<DataType, ResultType, NameType>): Promise<void> {
-    const entry = this.activeJobs.get(job.id);
-    if (entry) {
-      clearInterval(entry.renewalTimer);
-      this.activeJobs.delete(job.id);
-    }
-    await this.client.lrem(`${this.keyPrefix}:active`, 1, job.id);
-    await this.client.del(`${this.keyPrefix}:processing:${job.id}`);
-
-    // Group cleanup: use HDEL as an ownership gate so that if the stalled
-    // checker already released this slot, cleanup() does not double-decrement.
-    const groupId = job.opts.group?.id;
-    if (groupId) {
-      const owned = await this.client.hdel(`${this.keyPrefix}:group:job-map`, job.id);
-      if (owned > 0) {
-        const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
-        if (remaining < 0) {
-          await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
-        }
-      }
-    }
+    return true;
   }
 
   // A job was dispatched from scheduleOneGroup() (which already INCR'd
@@ -350,8 +427,21 @@ export class Worker<
     job: Job<DataType, ResultType, NameType>,
     token: string,
   ): Promise<void> {
-    await this.cleanup(job);
-    await this.applyRemovePolicy(job, 'complete');
+    this.inMemoryCleanup(job.id);
+    const groupId = job.opts.group?.id;
+    const policy = job.opts.removeOnComplete ?? this.opts.removeOnComplete;
+
+    if (policy === true) {
+      await this.finishJob({ jobId: job.id, token, groupId, mode: 'none' });
+      await job.remove();
+    } else {
+      await this.finishJob({
+        jobId: job.id, token, groupId, mode: 'zadd',
+        destKey: `${this.keyPrefix}:completed`,
+        score: job.finishedOn ?? Date.now(),
+      });
+      await this.applyKeepTrims(`${this.keyPrefix}:completed`, policy);
+    }
 
     await this.xadd('completed', {
       jobId: job.id,
@@ -368,39 +458,60 @@ export class Worker<
   ): Promise<void> {
     const isUnrecoverable = err instanceof UnrecoverableError;
     const maxAttempts = job.opts.attempts ?? 1;
+    const groupId = job.opts.group?.id;
+
+    this.inMemoryCleanup(job.id);
 
     job.failedReason = err.message;
     if (err.stack) job.stacktrace.push(err.stack);
     job.finishedOn = Date.now();
-    await job.save();
-
-    await this.cleanup(job);
+    if (!(await job.saveIfExists())) {
+      // Job was removed mid-processing — nothing to record or retry.
+      await this.finishJob({ jobId: job.id, token, groupId, mode: 'none' });
+      return;
+    }
 
     const canRetry = !isUnrecoverable && job.attemptsMade < maxAttempts;
 
     if (canRetry) {
       const delay = this.calcBackoff(job);
       if (delay > 0) {
-        await this.client.zadd(`${this.keyPrefix}:delayed`, Date.now() + delay, job.id);
+        await this.finishJob({
+          jobId: job.id, token, groupId, mode: 'zadd',
+          destKey: `${this.keyPrefix}:delayed`,
+          score: Date.now() + delay,
+        });
         await this.xadd('delayed', { jobId: job.id, delay });
+      } else if (groupId) {
+        // Re-enqueue with group and priority awareness.
+        const groupPriority = job.opts.group?.priority ?? 0;
+        await this.finishJob(groupPriority > 0
+          ? {
+              jobId: job.id, token, groupId, mode: 'zadd',
+              destKey: `${this.keyPrefix}:group:priority:${groupId}`,
+              score: groupPriority, register: true,
+            }
+          : {
+              jobId: job.id, token, groupId, mode: 'list',
+              destKey: `${this.keyPrefix}:group:${groupId}`,
+              pushCmd: 'rpush', register: true,
+            });
       } else {
-        // Re-enqueue with group and priority awareness
-        const groupId = job.opts.group?.id;
-        if (groupId) {
-          const groupPriority = job.opts.group?.priority ?? 0;
-          if (groupPriority > 0) {
-            await this.client.zadd(`${this.keyPrefix}:group:priority:${groupId}`, groupPriority, job.id);
-          } else {
-            await this.client.rpush(`${this.keyPrefix}:group:${groupId}`, job.id);
-          }
-          const added = await this.client.sadd(`${this.keyPrefix}:groups:set`, groupId);
-          if (added) await this.client.rpush(`${this.keyPrefix}:groups:active`, groupId);
-        } else {
-          await this.client.rpush(`${this.keyPrefix}:ready`, job.id);
-        }
+        await this.finishJob({ jobId: job.id, token, mode: 'list' });
       }
     } else {
-      await this.applyRemovePolicy(job, 'fail');
+      const policy = job.opts.removeOnFail ?? this.opts.removeOnFail;
+      if (policy === true) {
+        await this.finishJob({ jobId: job.id, token, groupId, mode: 'none' });
+        await job.remove();
+      } else {
+        await this.finishJob({
+          jobId: job.id, token, groupId, mode: 'zadd',
+          destKey: `${this.keyPrefix}:failed`,
+          score: job.finishedOn ?? Date.now(),
+        });
+        await this.applyKeepTrims(`${this.keyPrefix}:failed`, policy);
+      }
       await this.xadd('failed', { jobId: job.id, failedReason: err.message, prev: 'active' });
       this.emit('failed', job, err, 'active');
 
@@ -421,22 +532,12 @@ export class Worker<
     return delay; // fixed
   }
 
-  private async applyRemovePolicy(
-    job: Job<DataType, ResultType, NameType>,
-    outcome: 'complete' | 'fail',
+  // Post-finish trimming for keep-count / keep-age policies. The ZADD into the
+  // finished set itself happens atomically inside finishJob().
+  private async applyKeepTrims(
+    setKey: string,
+    policy: boolean | number | { count?: number; age?: number } | undefined,
   ): Promise<void> {
-    const policy = outcome === 'complete'
-      ? (job.opts.removeOnComplete ?? this.opts.removeOnComplete)
-      : (job.opts.removeOnFail ?? this.opts.removeOnFail);
-    const setKey = `${this.keyPrefix}:${outcome === 'complete' ? 'completed' : 'failed'}`;
-
-    if (policy === true) {
-      await job.remove();
-      return;
-    }
-
-    await this.client.zadd(setKey, job.finishedOn ?? Date.now(), job.id);
-
     const keepConfig = typeof policy === 'number'
       ? { count: policy }
       : typeof policy === 'object' && policy !== null
@@ -499,8 +600,8 @@ export class Worker<
       });
   }
 
-  // Schedule one job from each available group in a single pass.
-  // Returns the number of jobs pushed to the ready queue.
+  // Schedule one batch across the groups in rotation, in a single pass.
+  // Returns the number of groups for which at least one job was dispatched.
   private async scheduleGroupBatch(): Promise<number> {
     if (this._closing) return 0;
 
@@ -511,30 +612,38 @@ export class Worker<
     let scheduled = 0;
     // Cap at 64 groups per pass to avoid monopolising the event loop on huge queues.
     const limit = Math.min(len, 64);
+    const seen = new Set<string>();
     for (let i = 0; i < limit; i++) {
-      const groupId = await this.client.lpop(activeKey);
+      // Non-destructive rotation (head → tail in one atomic LMOVE): the group
+      // never leaves the list while it is being examined, so an error or crash
+      // mid-pass cannot drop it out of rotation the way the old LPOP-then-
+      // maybe-RPUSH pattern could.
+      const groupId = await this.client.lmove(activeKey, activeKey, 'LEFT', 'RIGHT');
       if (!groupId) break;
+      if (seen.has(groupId)) continue; // duplicate rotation entry — purged on retire
+      seen.add(groupId);
       if (await this.scheduleOneGroup(groupId)) scheduled++;
     }
     return scheduled;
   }
 
+  // Rotation model: the group stays in groups:active the whole time (the batch
+  // loop rotates it head → tail); this method never pushes it back. The only
+  // structural change is atomic retirement (empty-check + LREM + SREM in one
+  // Lua call) once the group has no waiting jobs left — a concurrent enqueue
+  // either lands before the check (group kept) or re-registers the group
+  // itself afterwards via the enqueue script's SADD.
   private async scheduleOneGroup(groupId: string): Promise<boolean> {
-    const activeKey = `${this.keyPrefix}:groups:active`;
+    const listKey = `${this.keyPrefix}:group:${groupId}`;
+    const zsetKey = `${this.keyPrefix}:group:priority:${groupId}`;
 
     // ── 1. Pause check ────────────────────────────────────────────────────────
     const isPaused = await this.client.sismember(`${this.keyPrefix}:groups:paused`, groupId);
-    if (isPaused) {
-      await this.client.rpush(activeKey, groupId);
-      return false;
-    }
+    if (isPaused) return false;
 
     // ── 2. Rate limit check (manual via rateLimitGroup or global limit) ───────
     const rateLimitTtl = await this.client.pttl(`${this.keyPrefix}:group:rate-limit:${groupId}`);
-    if (rateLimitTtl > 0) {
-      await this.client.rpush(activeKey, groupId);
-      return false;
-    }
+    if (rateLimitTtl > 0) return false;
 
     // ── 3. Resolve concurrency: local override > worker-level global default ──
     const localCfg = await this.client.get(`${this.keyPrefix}:group:cfg:${groupId}`);
@@ -546,107 +655,86 @@ export class Worker<
       (await this.client.get(`${this.keyPrefix}:running:${groupId}`)) ?? '0',
       10,
     );
+    if (currentRunning >= maxGroupConcurrency) return false;
 
-    if (currentRunning >= maxGroupConcurrency) {
-      await this.client.rpush(activeKey, groupId);
-      return false;
-    }
-
-    // ── 4. Group lock — multi-worker safety ───────────────────────────────────
+    // ── 4. Group lock — reduces cross-worker contention. Correctness does NOT
+    // depend on it: the dispatch script enforces the concurrency ceiling
+    // atomically, so even an expired lock cannot over-provision the group.
     const lockKey = `${this.keyPrefix}:lock:group:${groupId}`;
     const lockAcquired = await this.client.set(lockKey, this.id, 'EX', 30, 'NX');
-    if (!lockAcquired) {
-      await this.client.rpush(activeKey, groupId);
-      return false;
-    }
+    if (!lockAcquired) return false;
 
-    // ── 5. Fill available slots ───────────────────────────────────────────────
-    // Re-read currentRunning inside the lock: another worker may have incremented
-    // it between our pre-lock GET (step 3) and now, making the pre-lock value stale.
-    const freshRunning = parseInt(
-      (await this.client.get(`${this.keyPrefix}:running:${groupId}`)) ?? '0',
-      10,
-    );
-    if (freshRunning >= maxGroupConcurrency) {
-      await this.client.del(lockKey);
-      await this.client.rpush(activeKey, groupId);
-      return false;
-    }
-    const availableSlots = maxGroupConcurrency - freshRunning;
     let scheduled = 0;
+    try {
+      // ── 5. Fill available slots ─────────────────────────────────────────────
+      // Re-read currentRunning inside the lock: another worker may have
+      // incremented it between the pre-lock GET (step 3) and now.
+      const freshRunning = parseInt(
+        (await this.client.get(`${this.keyPrefix}:running:${groupId}`)) ?? '0',
+        10,
+      );
+      if (freshRunning >= maxGroupConcurrency) return false;
+      const availableSlots = maxGroupConcurrency - freshRunning;
 
-    for (let i = 0; i < availableSlots; i++) {
-      // Priority ZSET first (ZPOPMIN = lowest score = highest priority), then FIFO LIST.
-      let jobId: string | null = null;
-      const priorityPop = await this.client.zpopmin(`${this.keyPrefix}:group:priority:${groupId}`, 1);
-      if (priorityPop.length > 0) {
-        jobId = priorityPop[0]; // [member, score, ...]
-      } else {
-        jobId = await this.client.lpop(`${this.keyPrefix}:group:${groupId}`);
-      }
-      if (!jobId) break;
-
-      // ── Global rate limit: INCR counter, check against max ─────────────────
-      const globalLimit = this.opts.group?.limit;
-      if (globalLimit) {
-        const rateKey = `${this.keyPrefix}:group:rate:${groupId}`;
-        const count = await this.client.incr(rateKey);
-        if (count === 1) {
-          // First hit in this window — set the expiry.
-          await this.client.pexpire(rateKey, globalLimit.duration);
+      for (let i = 0; i < availableSlots; i++) {
+        // ── Global rate limit: consume a window slot BEFORE popping, so there
+        // is never a popped-but-not-dispatched job to lose in a crash. ───────
+        const globalLimit = this.opts.group?.limit;
+        let rateSlotTaken = false;
+        if (globalLimit) {
+          const rateKey = `${this.keyPrefix}:group:rate:${groupId}`;
+          const count = await this.client.incr(rateKey);
+          if (count === 1) {
+            // First hit in this window — set the expiry.
+            await this.client.pexpire(rateKey, globalLimit.duration);
+          }
+          if (count > globalLimit.max) {
+            // Limit exceeded — rate-limit the group until the window expires.
+            const windowTtl = await this.client.pttl(rateKey);
+            const delay = windowTtl > 0 ? windowTtl : globalLimit.duration;
+            await this.client.set(
+              `${this.keyPrefix}:group:rate-limit:${groupId}`, '1', 'PX', delay,
+            );
+            break;
+          }
+          rateSlotTaken = true;
         }
-        if (count > globalLimit.max) {
-          // Limit exceeded — put job back at front of queue and rate-limit the group.
-          await this.client.lpush(`${this.keyPrefix}:group:${groupId}`, jobId);
-          const windowTtl = await this.client.pttl(rateKey);
-          const delay = windowTtl > 0 ? windowTtl : globalLimit.duration;
-          await this.client.set(
-            `${this.keyPrefix}:group:rate-limit:${groupId}`, '1', 'PX', delay,
-          );
-          // Ensure group stays in active list so it's rescheduled after the window.
-          await this.client.rpush(activeKey, groupId);
+
+        // Atomic pop + dispatch: take the next job (priority zset first, then
+        // FIFO list), enforce the ceiling, INCR running:{groupId}, record
+        // group:job-map ownership (kept independent of the job hash so the
+        // slot can still be released if the hash disappears — see
+        // releaseGroupSlotForMissingJob()) and RPUSH to :ready in ONE Lua
+        // call. There is no popped-but-undispatched state for a crash to hit.
+        const jobId = await scripted(this.client).pmqPopDispatch(
+          zsetKey, listKey,
+          `${this.keyPrefix}:running:${groupId}`,
+          `${this.keyPrefix}:group:job-map`,
+          `${this.keyPrefix}:ready`,
+          groupId,
+          String(maxGroupConcurrency),
+        );
+        if (!jobId) {
+          // Group empty (or ceiling hit despite our lock) — hand back the
+          // rate-window slot we reserved for a job that never materialised.
+          if (rateSlotTaken) {
+            await this.client.decr(`${this.keyPrefix}:group:rate:${groupId}`).catch(() => {});
+          }
           break;
         }
+        scheduled++;
       }
 
-      // INCR running:{groupId}, HSET group:job-map (recorded independently of
-      // the job hash so the slot can still be released if the job hash
-      // disappears before cleanup() runs — see releaseGroupSlotForMissingJob()),
-      // and RPUSH to :ready all execute as one atomic Lua call so a process
-      // crash mid-dispatch can't leave the running counter incremented with no
-      // job-map entry to recover it.
-      await this.client.eval(
-        LUA_DISPATCH_JOB,
-        3,
-        `${this.keyPrefix}:running:${groupId}`,
-        `${this.keyPrefix}:group:job-map`,
-        `${this.keyPrefix}:ready`,
+      // ── 6. Retire the group if it has nothing left to schedule ─────────────
+      await scripted(this.client).pmqRetireGroup(
+        listKey, zsetKey,
+        `${this.keyPrefix}:groups:set`, `${this.keyPrefix}:groups:active`,
         groupId,
-        jobId,
       );
-      scheduled++;
+      return scheduled > 0;
+    } finally {
+      await this.client.del(lockKey).catch(() => {/* expires on its own */});
     }
-
-    // ── 6. Decide whether to keep group in active rotation ───────────────────
-    if (scheduled === 0) {
-      const listLen = await this.client.llen(`${this.keyPrefix}:group:${groupId}`);
-      const zsetLen = await this.client.zcard(`${this.keyPrefix}:group:priority:${groupId}`);
-      if (listLen === 0 && zsetLen === 0) {
-        await this.client.srem(`${this.keyPrefix}:groups:set`, groupId);
-      }
-      // If we didn't push to activeKey above (no rate limit), don't add again.
-    } else {
-      const listLen = await this.client.llen(`${this.keyPrefix}:group:${groupId}`);
-      const zsetLen = await this.client.zcard(`${this.keyPrefix}:group:priority:${groupId}`);
-      if (listLen > 0 || zsetLen > 0) {
-        await this.client.rpush(activeKey, groupId);
-      } else {
-        await this.client.srem(`${this.keyPrefix}:groups:set`, groupId);
-      }
-    }
-
-    await this.client.del(lockKey);
-    return scheduled > 0;
   }
 
   // ─── Delayed job promoter ──────────────────────────────────────────────────
@@ -674,61 +762,12 @@ export class Worker<
   }
 
   private async promoteDelayedJobsOnce(): Promise<void> {
-    const now = Date.now();
-    const ids = await this.client.zrangebyscore(`${this.keyPrefix}:delayed`, '-inf', now);
-    if (!ids.length) return;
-
-    const pipe = this.client.pipeline();
-    for (const id of ids) {
-      pipe.zrem(`${this.keyPrefix}:delayed`, id);
-    }
-    const results = await pipe.exec();
-
-    // ZREM is the atomic hand-off: only the caller whose ZREM actually removed
-    // the member (result === 1) owns promoting it. Every other worker (or an
-    // overlapping call in this same process) sees 0 and must not re-enqueue —
-    // otherwise the same job lands in :ready multiple times.
-    const claimedIds = ids.filter((_, i) => results?.[i]?.[1] === 1);
-    if (!claimedIds.length) return;
-
-    for (const id of claimedIds) {
-      // Re-enqueue respecting group/priority
-      const job = await Job.fromId<DataType, ResultType, NameType>(
-        this.client, this.name, this.opts.prefix ?? 'bull', id,
-      );
-      if (!job) continue;
-
-      if (job.opts.group?.id) {
-        const groupId = job.opts.group.id;
-        const groupPriority = job.opts.group.priority ?? 0;
-        const maxSize = job.opts.group.maxSize;
-        // A delayed job never went through Queue.add()'s maxSize check (it was
-        // diverted straight to :delayed before the group branch), so enforce
-        // it here via the same atomic check-and-enqueue used there.
-        const ok = await this.client.eval(
-          LUA_GROUP_ENQUEUE,
-          2,
-          `${this.keyPrefix}:group:${groupId}`,
-          `${this.keyPrefix}:group:priority:${groupId}`,
-          String(maxSize ?? -1),
-          id,
-          String(groupPriority),
-        );
-        if (ok === 0) {
-          // Group is at maxSize right now — defer promotion instead of
-          // dropping the job or bypassing the configured size guard; it will
-          // be retried on the next tick.
-          await this.client.zadd(`${this.keyPrefix}:delayed`, Date.now() + 1000, id);
-          continue;
-        }
-        const added = await this.client.sadd(`${this.keyPrefix}:groups:set`, groupId);
-        if (added) await this.client.rpush(`${this.keyPrefix}:groups:active`, groupId);
-      } else if ((job.opts.priority ?? 0) > 0) {
-        await this.client.zadd(`${this.keyPrefix}:priority`, job.opts.priority!, id);
-      } else {
-        await this.client.rpush(`${this.keyPrefix}:ready`, id);
-      }
-
+    // Shared with Queue.promoteJobs() so claim semantics, routing and maxSize
+    // enforcement can never drift apart between the two paths.
+    const promoted = await promoteDueDelayedJobs(
+      this.client, this.name, this.opts.prefix ?? 'bull',
+    );
+    for (const id of promoted) {
       await this.xadd('waiting', { jobId: id });
     }
   }
@@ -747,6 +786,10 @@ export class Worker<
     if (this._closing) return;
     const activeIds = await this.client.lrange(`${this.keyPrefix}:active`, 0, -1);
 
+    // Suspects seen lockless on the PREVIOUS scan; rebuilt every scan.
+    const priorSuspects = this.stalledSuspects;
+    const nextSuspects = new Set<string>();
+
     for (const jobId of activeIds) {
       // Skip jobs we are currently processing in this worker
       if (this.activeJobs.has(jobId)) continue;
@@ -754,63 +797,81 @@ export class Worker<
       const lockExists = await this.client.exists(`${this.keyPrefix}:processing:${jobId}`);
       if (lockExists) continue;
 
-      // Lock is gone but job is still in active — stalled
-      await this.client.lrem(`${this.keyPrefix}:active`, 1, jobId);
+      // Grace pass: a job freshly moved into :active sits lockless for one
+      // round-trip before its worker sets the processing lock. Reclaiming on
+      // the first lockless sighting turns that sliver into a false stall — a
+      // second copy of a RUNNING job — which cascades (the copies share one
+      // lock key). Only a job seen lockless on two consecutive scans, a full
+      // stalledInterval apart, is genuinely dead.
+      if (!priorSuspects.has(jobId)) {
+        nextSuspects.add(jobId);
+        continue;
+      }
 
+      // Lock gone across two scans — stalled for real. Reclaim ATOMICALLY via
+      // the guarded finish script: reading the job first (while it is still in
+      // :active) then moving it in one Lua call means a checker killed
+      // mid-reclaim cannot strand the job in no structure at all. The guard
+      // also rejects the reclaim if the lock reappeared or another checker won.
       const job = await Job.fromId<DataType, ResultType, NameType>(
         this.client, this.name, this.opts.prefix ?? 'bull', jobId,
       );
       if (!job) {
-        await this.releaseGroupSlotForMissingJob(jobId);
+        const groupId = await this.client.hget(`${this.keyPrefix}:group:job-map`, jobId);
+        await this.finishJob({ jobId, token: '', groupId: groupId ?? '', mode: 'none', guard: true });
         continue;
       }
 
       const maxStalledCount = this.opts.maxStalledCount ?? 1;
-
       const groupId = job.opts.group?.id;
 
       if (job.stalledCounter >= maxStalledCount) {
-        // Permanently failed — free the group slot before moving to failed set.
-        if (groupId) {
-          const owned = await this.client.hdel(`${this.keyPrefix}:group:job-map`, jobId);
-          if (owned > 0) {
-            const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
-            if (remaining < 0) await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
-          }
-        }
         job.failedReason = 'job stalled more than allowable limit';
         job.finishedOn = Date.now();
-        await job.save();
-        await this.client.zadd(`${this.keyPrefix}:failed`, job.finishedOn, jobId);
+        // Saved before the reclaim; if the guard then rejects (job came back to
+        // life), the live worker's own save overwrites this on real completion.
+        if (!(await job.saveIfExists())) {
+          await this.finishJob({ jobId, token: '', groupId, mode: 'none', guard: true });
+          continue;
+        }
+        const reclaimed = await this.finishJob({
+          jobId, token: '', groupId, mode: 'zadd', guard: true,
+          destKey: `${this.keyPrefix}:failed`, score: job.finishedOn,
+        });
+        if (reclaimed === 0) continue;
         await this.xadd('failed', { jobId, failedReason: job.failedReason, prev: 'active' });
         this.emit('failed', job, new Error(job.failedReason), 'active');
       } else {
         job.stalledCounter++;
-        await job.save();
-
-        if (groupId) {
-          const owned = await this.client.hdel(`${this.keyPrefix}:group:job-map`, jobId);
-          if (owned > 0) {
-            const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
-            if (remaining < 0) await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
-          }
-          // Re-enqueue respecting intra-group priority.
-          const groupPriority = job.opts.group?.priority ?? 0;
-          if (groupPriority > 0) {
-            await this.client.zadd(`${this.keyPrefix}:group:priority:${groupId}`, groupPriority, jobId);
-          } else {
-            await this.client.lpush(`${this.keyPrefix}:group:${groupId}`, jobId);
-          }
-          const added = await this.client.sadd(`${this.keyPrefix}:groups:set`, groupId);
-          if (added) await this.client.rpush(`${this.keyPrefix}:groups:active`, groupId);
-        } else {
-          await this.client.rpush(`${this.keyPrefix}:ready`, jobId);
+        if (!(await job.saveIfExists())) {
+          // Removed while stalled — release the slot and don't resurrect the id.
+          await this.finishJob({ jobId, token: '', groupId, mode: 'none', guard: true });
+          continue;
         }
+
+        // Re-enqueue at the FRONT, respecting intra-group priority.
+        const groupPriority = job.opts.group?.priority ?? 0;
+        const reclaimed = groupId
+          ? await this.finishJob(groupPriority > 0
+              ? {
+                  jobId, token: '', groupId, mode: 'zadd', guard: true,
+                  destKey: `${this.keyPrefix}:group:priority:${groupId}`,
+                  score: groupPriority, register: true,
+                }
+              : {
+                  jobId, token: '', groupId, mode: 'list', guard: true,
+                  destKey: `${this.keyPrefix}:group:${groupId}`,
+                  pushCmd: 'lpush', register: true,
+                })
+          : await this.finishJob({ jobId, token: '', mode: 'list', guard: true });
+        if (reclaimed === 0) continue;
 
         await this.xadd('stalled', { jobId });
         this.emit('stalled', jobId, 'active');
       }
     }
+
+    this.stalledSuspects = nextSuspects;
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────

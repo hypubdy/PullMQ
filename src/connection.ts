@@ -1,11 +1,12 @@
 import Redis from 'ioredis';
 import type { ConnectionOptions } from './types';
+import { scripted } from './scripts';
 
 export function createClient(connection: ConnectionOptions): Redis {
   if (connection instanceof Redis) {
-    return connection;
+    return scripted(connection);
   }
-  return new Redis({
+  return scripted(new Redis({
     host: connection.host ?? '127.0.0.1',
     port: connection.port ?? 6379,
     password: connection.password,
@@ -13,5 +14,5 @@ export function createClient(connection: ConnectionOptions): Redis {
     ...(connection.tls ? { tls: connection.tls as object } : {}),
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
-  });
+  }));
 }

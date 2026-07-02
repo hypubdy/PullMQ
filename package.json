@@ -1,6 +1,6 @@
 {
   "name": "@hypubdy/pullmq",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Redis-based message queue with BullMQ Pro-compatible API and group scheduling",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

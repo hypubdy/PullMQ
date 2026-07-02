@@ -54,7 +54,7 @@ npm install @hypubdy/pullmq ioredis
 pnpm add @hypubdy/pullmq ioredis
 ```
 
-> Requires Node.js ≥ 18 and a running Redis ≥ 6 instance.
+> Requires Node.js ≥ 18 and a running Redis ≥ 6.2 instance (atomic job pickup uses `LMOVE`/`BLMOVE`).
 
 ## Quick Start
 
@@ -207,7 +207,7 @@ const counts = await queue.getCountsPerPriorityForGroup('g1', [1, 10, 0])
 | `lockDuration` | `number` | `30000` | Job lock TTL (ms) |
 | `stalledInterval` | `number` | `30000` | Stall check interval (ms) |
 | `maxStalledCount` | `number` | `1` | Max stalls before permanent fail |
-| `drainDelay` | `number` | `5` | BLPOP timeout (s) |
+| `drainDelay` | `number` | `5` | BLMOVE timeout (s) |
 
 | Method | Description |
 |---|---|

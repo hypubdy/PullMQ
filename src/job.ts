@@ -1,5 +1,6 @@
 import type Redis from 'ioredis';
 import type { JobsOptions, JobJson, JobState, FinishedStatus, JobProgress } from './types';
+import { scripted } from './scripts';
 
 export class Job<
   DataType = unknown,
@@ -146,18 +147,26 @@ export class Job<
   }
 
   async promote(): Promise<void> {
-    const score = await this.client.zscore(`${this.queueQualifiedName}:delayed`, this.id);
-    if (score === null) return;
-    await this.client.zrem(`${this.queueQualifiedName}:delayed`, this.id);
-    if (this.opts.group?.id) {
-      await this.client.rpush(`${this.queueQualifiedName}:group:${this.opts.group.id}`, this.id);
-      const added = await this.client.sadd(`${this.queueQualifiedName}:groups:set`, this.opts.group.id);
-      if (added) await this.client.rpush(`${this.queueQualifiedName}:groups:active`, this.opts.group.id);
-    } else if (this.priority > 0) {
-      await this.client.zadd(`${this.queueQualifiedName}:priority`, this.priority, this.id);
-    } else {
-      await this.client.rpush(`${this.queueQualifiedName}:ready`, this.id);
-    }
+    // One atomic script: the ZREM inside is the claim gate (a concurrent
+    // promote() or worker promoter that loses the race gets 0 and enqueues
+    // nothing), and claim + route being a single call means a crash in
+    // between cannot lose the job. Explicit promotion never re-checks
+    // maxSize (-1), so the defer branch is unreachable.
+    const groupId = this.opts.group?.id ?? '';
+    await scripted(this.client).pmqPromoteJob(
+      `${this.queueQualifiedName}:delayed`,
+      `${this.queueQualifiedName}:group:${groupId}`,
+      `${this.queueQualifiedName}:group:priority:${groupId}`,
+      `${this.queueQualifiedName}:groups:set`,
+      `${this.queueQualifiedName}:groups:active`,
+      `${this.queueQualifiedName}:priority`,
+      `${this.queueQualifiedName}:ready`,
+      this.id,
+      groupId,
+      String(this.opts.group?.priority ?? 0),
+      String(this.priority),
+      '-1', '0',
+    );
   }
 
   async retry(state: FinishedStatus = 'failed'): Promise<void> {
@@ -167,10 +176,22 @@ export class Job<
     this.failedReason = '';
     this.finishedOn = undefined;
     await this.save();
-    if (this.opts.group?.id) {
-      await this.client.rpush(`${this.queueQualifiedName}:group:${this.opts.group.id}`, this.id);
-      const added = await this.client.sadd(`${this.queueQualifiedName}:groups:set`, this.opts.group.id);
-      if (added) await this.client.rpush(`${this.queueQualifiedName}:groups:active`, this.opts.group.id);
+    await this.enqueueTo(this.opts.group?.priority ?? 0);
+  }
+
+  // Route this job to its destination structure (group list/zset via the
+  // atomic enqueue-and-register script, priority zset, or :ready). Explicit
+  // promote/retry never re-checks maxSize — the job was already admitted once.
+  private async enqueueTo(groupPriority: number): Promise<void> {
+    const groupId = this.opts.group?.id;
+    if (groupId) {
+      await scripted(this.client).pmqGroupEnqueue(
+        `${this.queueQualifiedName}:group:${groupId}`,
+        `${this.queueQualifiedName}:group:priority:${groupId}`,
+        `${this.queueQualifiedName}:groups:set`,
+        `${this.queueQualifiedName}:groups:active`,
+        '-1', this.id, String(groupPriority), groupId, 'rpush',
+      );
     } else if (this.priority > 0) {
       await this.client.zadd(`${this.queueQualifiedName}:priority`, this.priority, this.id);
     } else {
@@ -269,8 +290,8 @@ export class Job<
     };
   }
 
-  async save(): Promise<void> {
-    await this.client.hset(this.jobKey, {
+  private serialize(): Record<string, string> {
+    return {
       id: this.id,
       name: this.name,
       data: JSON.stringify(this.data),
@@ -285,7 +306,26 @@ export class Job<
       returnvalue: JSON.stringify(this.returnvalue),
       failedReason: this.failedReason,
       stacktrace: JSON.stringify(this.stacktrace),
-    });
+    };
+  }
+
+  async save(): Promise<void> {
+    await this.client.hset(this.jobKey, this.serialize());
+  }
+
+  /**
+   * Persist the job ONLY if its hash still exists. Returns false when the job
+   * was removed (e.g. Queue.remove() raced with processing) — callers must
+   * treat that as "job is gone" and skip any completed/failed bookkeeping
+   * instead of resurrecting the hash with a blind HSET.
+   */
+  async saveIfExists(): Promise<boolean> {
+    const fieldValues: string[] = [];
+    for (const [field, value] of Object.entries(this.serialize())) {
+      fieldValues.push(field, value);
+    }
+    const written = await scripted(this.client).pmqSaveJobIfExists(this.jobKey, ...fieldValues);
+    return written === 1;
   }
 
   static async create<T, R, N extends string = string>(
