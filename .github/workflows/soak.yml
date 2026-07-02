@@ -1,0 +1,63 @@
+name: Kill Soak
+
+# Multi-process crash-safety soak: worker processes under random SIGKILL,
+# asserting the invariants unit tests can't (no lost jobs, no stuck groups,
+# all counters back to zero). See examples/06-soak-kill.ts.
+on:
+  schedule:
+    # Daily at 02:17 UTC (odd minute to avoid the top-of-hour scheduler rush).
+    - cron: "17 2 * * *"
+  push:
+    branches: [main]
+    # Self-validate whenever the soak itself (or this workflow) changes.
+    paths:
+      - ".github/workflows/soak.yml"
+      - "examples/06-soak-kill.ts"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Load duration in seconds"
+        required: false
+        default: "180"
+      workers:
+        description: "Number of worker processes"
+        required: false
+        default: "4"
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run kill soak
+        run: npm run soak -- ${{ github.event.inputs.duration || '180' }} ${{ github.event.inputs.workers || '4' }}
+
+      - name: Upload worker stderr log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-worker-log
+          # os.tmpdir() on the ubuntu runner — the soak script prints this path.
+          path: /tmp/pullmq-soak-workers.log
+          if-no-files-found: ignore

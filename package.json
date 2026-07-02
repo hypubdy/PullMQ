@@ -26,6 +26,7 @@
     "test:watch": "vitest",
     "bench": "tsx examples/bench.ts",
     "stress": "tsx examples/05-stress.ts",
+    "soak": "tsx examples/06-soak-kill.ts",
     "ex:pro-groups": "tsx examples/07-pro-groups.ts",
     "clean": "rm -rf dist"
   },
