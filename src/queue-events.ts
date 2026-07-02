@@ -64,10 +64,15 @@ export class QueueEvents extends EventEmitter {
             if (event) {
               // Wrap emit so a throwing listener does not prevent lastId from
               // advancing — the event was delivered even if a listener errored.
+              // Only re-emit on 'error' if someone is listening: EventEmitter
+              // throws synchronously for an unhandled 'error' event, which
+              // would otherwise escape this catch and kill the whole read loop.
               try {
                 this.emit(event, data, msgId);
               } catch (listenerErr) {
-                this.emit('error', listenerErr);
+                if (this.listenerCount('error') > 0) {
+                  this.emit('error', listenerErr);
+                }
               }
             }
             // Advance lastId only after delivery so a crash before this line
@@ -77,7 +82,9 @@ export class QueueEvents extends EventEmitter {
         }
       } catch (err) {
         if (!this._closing) {
-          this.emit('error', err);
+          if (this.listenerCount('error') > 0) {
+            this.emit('error', err);
+          }
           await new Promise((r) => setTimeout(r, 1000));
         }
       }

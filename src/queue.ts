@@ -10,26 +10,7 @@ import type {
 import { Job } from './job';
 import { createClient } from './connection';
 import { GroupMaxSizeExceededError } from './errors';
-
-// Atomically checks group size and enqueues the job in one round-trip.
-// Returns 1 on success, 0 when maxSize would be exceeded.
-const LUA_GROUP_ENQUEUE = `
-local listKey  = KEYS[1]
-local zsetKey  = KEYS[2]
-local maxSize  = tonumber(ARGV[1])
-local jobId    = ARGV[2]
-local priority = tonumber(ARGV[3])
-if maxSize > 0 then
-  local sz = redis.call('llen', listKey) + redis.call('zcard', zsetKey)
-  if sz >= maxSize then return 0 end
-end
-if priority > 0 then
-  redis.call('zadd', zsetKey, priority, jobId)
-else
-  redis.call('rpush', listKey, jobId)
-end
-return 1
-`;
+import { LUA_GROUP_ENQUEUE } from './scripts';
 
 export class Queue<
   DataType = unknown,
@@ -106,16 +87,18 @@ export class Queue<
 
       // Atomic size-check + enqueue via Lua: eliminates the TOCTOU race where
       // two concurrent add() calls both pass a non-atomic llen+zcard check.
-      const ok = await (this.client as Redis).eval(
+      // maxSize=undefined is passed as -1 ("unlimited") so it stays distinct
+      // from an explicit maxSize:0 ("reject every add").
+      const ok = await this.client.eval(
         LUA_GROUP_ENQUEUE,
         2,
         `${this.keyPrefix}:group:${groupId}`,
         `${this.keyPrefix}:group:priority:${groupId}`,
-        String(maxSize ?? 0),
+        String(maxSize ?? -1),
         job.id,
         String(groupPriority),
       );
-      if (ok === 0) throw new GroupMaxSizeExceededError(groupId, maxSize!);
+      if (ok === 0) throw new GroupMaxSizeExceededError(groupId, maxSize ?? 0);
 
       // ── Register group in round-robin tracking ────────────────────────────
       const added = await this.client.sadd(`${this.keyPrefix}:groups:set`, groupId);
@@ -304,6 +287,8 @@ export class Queue<
     if (!job) return 0;
     await job.remove();
 
+    const groupId = job.opts.group?.id;
+
     const pipe = this.client.pipeline();
     pipe.zrem(`${this.keyPrefix}:completed`, jobId);
     pipe.zrem(`${this.keyPrefix}:failed`, jobId);
@@ -311,7 +296,25 @@ export class Queue<
     pipe.zrem(`${this.keyPrefix}:priority`, jobId);
     pipe.lrem(`${this.keyPrefix}:ready`, 0, jobId);
     pipe.lrem(`${this.keyPrefix}:active`, 0, jobId);
+    if (groupId) {
+      pipe.lrem(`${this.keyPrefix}:group:${groupId}`, 0, jobId);
+      pipe.zrem(`${this.keyPrefix}:group:priority:${groupId}`, jobId);
+    }
     await pipe.exec();
+
+    // The job may have already been dispatched (running:{groupId} incremented,
+    // group:job-map[jobId] set) before being removed. Since it's now gone from
+    // :ready/:active, no worker will ever discover it's missing and release the
+    // slot itself — release it here so the group's concurrency count doesn't leak.
+    if (groupId) {
+      const owned = await this.client.hdel(`${this.keyPrefix}:group:job-map`, jobId);
+      if (owned > 0) {
+        const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
+        if (remaining < 0) {
+          await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
+        }
+      }
+    }
 
     await this.xadd('removed', { jobId, prev: 'unknown' });
     return 1;

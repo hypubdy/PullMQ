@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import Redis from 'ioredis'
-import { Queue, Worker } from '../src'
+import { Queue, Worker, QueueEvents } from '../src'
 import { GroupMaxSizeExceededError, GroupRateLimitError } from '../src/errors'
 
 const connection = { host: '127.0.0.1', port: 6379 }
@@ -339,6 +339,17 @@ describe('Group maxSize', () => {
     await queue.obliterate({ force: true })
     await queue.close()
   })
+
+  it('maxSize: 0 rejects every add instead of silently becoming unlimited', async () => {
+    const queue = new Queue<{ i: number }, void>('grp-max-zero', { connection })
+
+    await expect(
+      queue.add('t', { i: 0 }, { group: { id: 'g', maxSize: 0 } }),
+    ).rejects.toBeInstanceOf(GroupMaxSizeExceededError)
+
+    await queue.obliterate({ force: true })
+    await queue.close()
+  })
 })
 
 describe('Group intra-priority', () => {
@@ -498,6 +509,185 @@ describe('Group slot leak when job hash disappears mid-dispatch', () => {
 
     await client.quit()
     await worker.close()
+    await queue.obliterate({ force: true })
+    await queue.close()
+  })
+})
+
+describe('Queue.remove() releasing a dispatched group slot', () => {
+  afterEach(flush)
+
+  it('decrements running:{groupId} and clears group:job-map when removing an already-dispatched job', async () => {
+    const queue = new Queue<{ i: number }, void>('grp-remove', { connection })
+    const keyPrefix = 'bull:grp-remove'
+    const client = new Redis(connection)
+
+    const job = await queue.add('t', { i: 0 }, { group: { id: 'tenant-A' } })
+
+    const worker = new Worker<{ i: number }, void>(
+      'grp-remove',
+      async () => {},
+      { connection, autorun: false, drainDelay: 1, group: { concurrency: 1 } },
+    )
+    worker.on('error', () => {})
+    const w = worker as unknown as { scheduleOneGroup(groupId: string): Promise<boolean> }
+
+    // Dispatch it (running:tenant-A incremented, group:job-map recorded), same
+    // as production, then remove it before any worker loads the job hash.
+    expect(await w.scheduleOneGroup('tenant-A')).toBe(true)
+    expect(await client.get(`${keyPrefix}:running:tenant-A`)).toBe('1')
+
+    await queue.remove(job.id)
+
+    // Before the fix, running:tenant-A stayed pinned at 1 forever since the
+    // id was already gone from :ready, so no worker would ever discover it
+    // was missing and release the slot.
+    expect(await client.get(`${keyPrefix}:running:tenant-A`)).toBe('0')
+    expect(await client.hget(`${keyPrefix}:group:job-map`, job.id)).toBeNull()
+
+    await client.quit()
+    await worker.close()
+    await queue.obliterate({ force: true })
+    await queue.close()
+  })
+
+  it('removes a not-yet-dispatched job from its group list without touching running:{groupId}', async () => {
+    const queue = new Queue<{ i: number }, void>('grp-remove-waiting', { connection })
+    const keyPrefix = 'bull:grp-remove-waiting'
+    const client = new Redis(connection)
+
+    const job = await queue.add('t', { i: 0 }, { group: { id: 'tenant-A' } })
+    expect(await client.lrange(`${keyPrefix}:group:tenant-A`, 0, -1)).toContain(job.id)
+
+    await queue.remove(job.id)
+
+    expect(await client.lrange(`${keyPrefix}:group:tenant-A`, 0, -1)).not.toContain(job.id)
+    expect(await client.get(`${keyPrefix}:running:tenant-A`)).toBeNull()
+
+    await client.quit()
+    await queue.obliterate({ force: true })
+    await queue.close()
+  })
+})
+
+describe('releaseGroupSlotForMissingJob concurrency guard', () => {
+  afterEach(flush)
+
+  it('only decrements once when called twice concurrently for the same jobId', async () => {
+    const queue = new Queue<{ i: number }, void>('grp-double-release', { connection })
+    const keyPrefix = 'bull:grp-double-release'
+    const client = new Redis(connection)
+
+    const job = await queue.add('t', { i: 0 }, { group: { id: 'tenant-A' } })
+
+    const worker = new Worker<{ i: number }, void>(
+      'grp-double-release',
+      async () => {},
+      { connection, autorun: false, drainDelay: 1, group: { concurrency: 1 } },
+    )
+    worker.on('error', () => {})
+    const w = worker as unknown as {
+      scheduleOneGroup(groupId: string): Promise<boolean>
+      releaseGroupSlotForMissingJob(jobId: string): Promise<void>
+    }
+
+    expect(await w.scheduleOneGroup('tenant-A')).toBe(true)
+    expect(await client.get(`${keyPrefix}:running:tenant-A`)).toBe('1')
+
+    // Simulate two independent discovery paths (processJob's missing-job
+    // branch and the stalled checker's missing-job branch) racing on the
+    // same jobId after the job hash has vanished.
+    await client.del(`${keyPrefix}:job:${job.id}`)
+    await Promise.all([
+      w.releaseGroupSlotForMissingJob(job.id),
+      w.releaseGroupSlotForMissingJob(job.id),
+    ])
+
+    // Must land at 0, not -1 — only the caller whose HDEL actually removed
+    // the entry may decrement.
+    expect(await client.get(`${keyPrefix}:running:tenant-A`)).toBe('0')
+
+    await client.quit()
+    await worker.close()
+    await queue.obliterate({ force: true })
+    await queue.close()
+  })
+})
+
+describe('Delayed job promotion respects group maxSize', () => {
+  afterEach(flush)
+
+  it('defers promotion instead of exceeding maxSize when a delayed job would overflow the group', async () => {
+    const queue = new Queue<{ i: number }, void>('grp-delay-maxsize', { connection })
+    const keyPrefix = 'bull:grp-delay-maxsize'
+    const client = new Redis(connection)
+
+    // Fill the group to its maxSize with jobs that have no delay.
+    await queue.add('t', { i: 0 }, { group: { id: 'g', maxSize: 1 } })
+    // This one bypasses the maxSize check at add-time (delay diverts it to
+    // :delayed before the group branch runs) — it must not bypass the check
+    // at promotion-time either.
+    const delayedJob = await queue.add('t', { i: 1 }, { group: { id: 'g', maxSize: 1 }, delay: 1 })
+
+    await new Promise((r) => setTimeout(r, 10))
+
+    const worker = new Worker<{ i: number }, void>(
+      'grp-delay-maxsize',
+      async () => {},
+      { connection, autorun: false, drainDelay: 1 },
+    )
+    worker.on('error', () => {})
+    const w = worker as unknown as { promoteDelayedJobsOnce(): Promise<void> }
+
+    await w.promoteDelayedJobsOnce()
+
+    // The group is already at maxSize:1 — the delayed job must not have been
+    // force-pushed into the group list, exceeding the configured limit.
+    const groupLen = await client.llen(`${keyPrefix}:group:g`)
+    expect(groupLen).toBe(1)
+    // Instead it should have been deferred back onto :delayed for a retry.
+    expect(await client.zscore(`${keyPrefix}:delayed`, delayedJob.id)).not.toBeNull()
+
+    await client.quit()
+    await worker.close()
+    await queue.obliterate({ force: true })
+    await queue.close()
+  })
+})
+
+describe('QueueEvents survives a throwing listener with no error handler', () => {
+  afterEach(flush)
+
+  it('keeps delivering events after a listener throws, even with no "error" listener attached', async () => {
+    const queue = new Queue<{ i: number }, void>('qe-throw', { connection })
+    const events = new QueueEvents('qe-throw', { connection, blockingTimeout: 200 })
+    // Deliberately no `.on('error', ...)` — this is the exact regression: Node's
+    // EventEmitter throws synchronously on an unhandled 'error' emit, which used
+    // to escape both catch blocks in consumeEvents() and kill the whole loop.
+
+    const received: unknown[] = []
+    let threwOnce = false
+    events.on('added', (data: unknown) => {
+      if (!threwOnce) {
+        threwOnce = true
+        throw new Error('boom')
+      }
+      received.push(data)
+    })
+
+    events.run().catch(() => {})
+    await events.waitUntilReady()
+
+    await queue.add('t', { i: 0 }, {})
+    await new Promise((r) => setTimeout(r, 100))
+    await queue.add('t', { i: 1 }, {})
+    await new Promise((r) => setTimeout(r, 200))
+
+    // The second event must still arrive — the loop must not have died when
+    // the first listener threw with no 'error' listener registered.
+    expect(received.length).toBe(1)
+
+    await events.close()
     await queue.obliterate({ force: true })
     await queue.close()
   })

@@ -4,6 +4,7 @@ import type { WorkerOptions, Processor, JobsOptions } from './types';
 import { Job } from './job';
 import { createClient } from './connection';
 import { UnrecoverableError, GroupRateLimitError } from './errors';
+import { LUA_GROUP_ENQUEUE, LUA_DISPATCH_JOB } from './scripts';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -332,10 +333,16 @@ export class Worker<
   private async releaseGroupSlotForMissingJob(jobId: string): Promise<void> {
     const groupId = await this.client.hget(`${this.keyPrefix}:group:job-map`, jobId);
     if (!groupId) return;
-    await this.client.hdel(`${this.keyPrefix}:group:job-map`, jobId);
-    const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
-    if (remaining < 0) {
-      await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
+    // Gate the decrement on HDEL's return value — same ownership pattern as
+    // cleanup() and checkStalledJobs() — so two concurrent callers racing on
+    // the same jobId (e.g. this method invoked from both processJob's and
+    // checkStalledJobs' missing-job branches) can't both decrement.
+    const owned = await this.client.hdel(`${this.keyPrefix}:group:job-map`, jobId);
+    if (owned > 0) {
+      const remaining = await this.client.decr(`${this.keyPrefix}:running:${groupId}`);
+      if (remaining < 0) {
+        await this.client.set(`${this.keyPrefix}:running:${groupId}`, '0');
+      }
     }
   }
 
@@ -602,12 +609,21 @@ export class Worker<
         }
       }
 
-      await this.client.incr(`${this.keyPrefix}:running:${groupId}`);
-      // Recorded independently of the job hash so the group slot can still be
-      // released if the job hash disappears before cleanup() runs (obliterate,
-      // remove(), LRU eviction). See releaseGroupSlotForMissingJob().
-      await this.client.hset(`${this.keyPrefix}:group:job-map`, jobId, groupId);
-      await this.client.rpush(`${this.keyPrefix}:ready`, jobId);
+      // INCR running:{groupId}, HSET group:job-map (recorded independently of
+      // the job hash so the slot can still be released if the job hash
+      // disappears before cleanup() runs — see releaseGroupSlotForMissingJob()),
+      // and RPUSH to :ready all execute as one atomic Lua call so a process
+      // crash mid-dispatch can't leave the running counter incremented with no
+      // job-map entry to recover it.
+      await this.client.eval(
+        LUA_DISPATCH_JOB,
+        3,
+        `${this.keyPrefix}:running:${groupId}`,
+        `${this.keyPrefix}:group:job-map`,
+        `${this.keyPrefix}:ready`,
+        groupId,
+        jobId,
+      );
       scheduled++;
     }
 
@@ -685,10 +701,25 @@ export class Worker<
       if (job.opts.group?.id) {
         const groupId = job.opts.group.id;
         const groupPriority = job.opts.group.priority ?? 0;
-        if (groupPriority > 0) {
-          await this.client.zadd(`${this.keyPrefix}:group:priority:${groupId}`, groupPriority, id);
-        } else {
-          await this.client.rpush(`${this.keyPrefix}:group:${groupId}`, id);
+        const maxSize = job.opts.group.maxSize;
+        // A delayed job never went through Queue.add()'s maxSize check (it was
+        // diverted straight to :delayed before the group branch), so enforce
+        // it here via the same atomic check-and-enqueue used there.
+        const ok = await this.client.eval(
+          LUA_GROUP_ENQUEUE,
+          2,
+          `${this.keyPrefix}:group:${groupId}`,
+          `${this.keyPrefix}:group:priority:${groupId}`,
+          String(maxSize ?? -1),
+          id,
+          String(groupPriority),
+        );
+        if (ok === 0) {
+          // Group is at maxSize right now — defer promotion instead of
+          // dropping the job or bypassing the configured size guard; it will
+          // be retried on the next tick.
+          await this.client.zadd(`${this.keyPrefix}:delayed`, Date.now() + 1000, id);
+          continue;
         }
         const added = await this.client.sadd(`${this.keyPrefix}:groups:set`, groupId);
         if (added) await this.client.rpush(`${this.keyPrefix}:groups:active`, groupId);
